@@ -35,6 +35,7 @@ typedef struct WIN_NCLView {
     const void * source;
     BOOL compressed;
     NNSG2dPaletteData palette;
+    u32 storedBytes;
     NNSG2dPaletteCompressInfo compression;
     struct WIN_NCLView * next;
 } WIN_NCLView;
@@ -115,22 +116,61 @@ static BOOL WIN_ReadPalette(const void * source, WIN_NNSG2dPaletteData * serial)
         && serial->szByte <= UINTPTR_MAX - ((uintptr_t)source + serial->pRawData);
 }
 
+static BOOL WIN_ValidatePalette(void * file, u32 available, const u8 ** source, WIN_NNSG2dPaletteData * serial, u32 * storedBytes)
+{
+    u32 size = 0, cmpSize = 0;
+    const u8 * cmp;
+    *source = WIN_FindPaletteBlock(file, available, NNS_G2D_BINBLK_SIG_PALETTEDATA, &size);
+    if (!*source || size < sizeof(*serial) || !WIN_ReadPalette(*source, serial) || serial->pRawData > size) return FALSE;
+    *storedBytes = serial->szByte;
+    cmp = WIN_FindPaletteBlock(file, available, NNS_G2D_BINBLK_SIG_PALETTECOMPINFO, &cmpSize);
+    if (cmp) {
+        WIN_NNSG2dPaletteCompressInfo info;
+        u32 onePalette = serial->fmt == GX_TEXFMT_PLTT16 ? 32 : 512;
+        u32 i;
+        if (cmpSize < sizeof(info)) return FALSE;
+        memcpy(&info, cmp, sizeof(info));
+        if (info.pPlttIdxTbl < sizeof(info) || (info.pPlttIdxTbl & 1) || info.pPlttIdxTbl > cmpSize
+            || (u32)info.numPalette * sizeof(u16) > cmpSize - info.pPlttIdxTbl) return FALSE;
+        /* PCMP stores packed palettes. szByte is their expanded VRAM extent,
+         * not the number of bytes physically following the PLTT record. */
+        *storedBytes = (u32)info.numPalette * onePalette;
+        for (i = 0; i < info.numPalette; ++i) {
+            u16 index;
+            memcpy(&index, cmp + info.pPlttIdxTbl + i * sizeof(index), sizeof(index));
+            if (((u32)index + 1) * onePalette > serial->szByte) return FALSE;
+        }
+    }
+    return *storedBytes <= size - serial->pRawData;
+}
+
+static u32 WIN_PaletteStoredBytes(const NNSG2dPaletteData * data)
+{
+    WIN_NCLView * view;
+    u32 size = data->szByte;
+    WIN_LockPaletteViews();
+    for (view = s_paletteViews; view; view = view->next) {
+        if (!view->compressed && &view->palette == data) { size = view->storedBytes; break; }
+    }
+    WIN_UnlockPaletteViews();
+    return size;
+}
+
 BOOL NNS_G2dGetUnpackedPaletteDataSized(void * file, u32 available, NNSG2dPaletteData ** output)
 {
-    u32 size = 0;
+    u32 storedBytes = 0;
     const u8 * source;
     WIN_NNSG2dPaletteData serial;
     WIN_NCLView * view;
     if (!output) return FALSE;
     *output = NULL;
-    source = WIN_FindPaletteBlock(file, available, NNS_G2D_BINBLK_SIG_PALETTEDATA, &size);
-    if (!source || size < sizeof(serial) || !WIN_ReadPalette(source, &serial)
-        || serial.pRawData > size || serial.szByte > size - serial.pRawData) return FALSE;
+    if (!WIN_ValidatePalette(file, available, &source, &serial, &storedBytes)) return FALSE;
     WIN_LockPaletteViews();
     view = WIN_FindOrCreatePaletteView(source, FALSE);
     if (view) {
         view->palette.fmt = serial.fmt; view->palette.bExtendedPlt = serial.bExtendedPlt;
         view->palette.szByte = serial.szByte; view->palette.pRawData = (void *)(source + serial.pRawData);
+        view->storedBytes = storedBytes;
         *output = &view->palette;
     }
     WIN_UnlockPaletteViews();
@@ -142,6 +182,9 @@ BOOL NNS_G2dGetUnpackedPaletteCompressInfoSized(void * file, u32 available, NNSG
     u32 size = 0;
     const u8 * source;
     WIN_NNSG2dPaletteCompressInfo serial;
+    WIN_NNSG2dPaletteData palette;
+    const u8 * paletteSource;
+    u32 storedBytes;
     if (!output) return FALSE;
     *output = NULL;
     source = WIN_FindPaletteBlock(file, available, NNS_G2D_BINBLK_SIG_PALETTECOMPINFO, &size);
@@ -149,6 +192,7 @@ BOOL NNS_G2dGetUnpackedPaletteCompressInfoSized(void * file, u32 available, NNSG
     memcpy(&serial, source, sizeof(serial));
     if (serial.pPlttIdxTbl < sizeof(serial) || (serial.pPlttIdxTbl & 1)
         || serial.pPlttIdxTbl > size || (u32)serial.numPalette * sizeof(u16) > size - serial.pPlttIdxTbl) return FALSE;
+    if (!WIN_ValidatePalette(file, available, &paletteSource, &palette, &storedBytes)) return FALSE;
     *output = NNSi_G2dUnpackNCLCmpInfo((NNSG2dPaletteCompressInfo *)(void *)source);
     return *output != NULL;
 }
@@ -161,6 +205,7 @@ static void DumpPalette_ (const NNSG2dPaletteData * pPlttData)
     {
 #ifdef SDK_PORT
         u32 i;
+        const u32 colorCount = WIN_PaletteStoredBytes(pPlttData) / sizeof(u16);
 #else
         u16 i;
 #endif
@@ -168,7 +213,7 @@ static void DumpPalette_ (const NNSG2dPaletteData * pPlttData)
         OS_Printf("\n ---------------- palette ---------------- \n");
         for (i = 0; i <
 #ifdef SDK_PORT
-             pPlttData->szByte / sizeof(u16)
+             colorCount
 #else
              16 * 16
 #endif
