@@ -109,6 +109,10 @@ static BOOL WIN_ReadPalette(const void * source, WIN_NNSG2dPaletteData * serial)
 {
     if (!source) return FALSE;
     memcpy(serial, source, sizeof(*serial));
+    /* The public nitrogfx writer stores its compNum metadata in the upper
+     * half of this word. Reviewed Pokemon palettes use compNum10 with fmt4.
+     * It is not part of GXTexFmt; retain strict rejection of other flags. */
+    if ((u32)serial->fmt == UINT32_C(0x000a0004)) serial->fmt = GX_TEXFMT_PLTT256;
     return serial->fmt >= GX_TEXFMT_PLTT16 && serial->fmt <= GX_TEXFMT_PLTT256
         && serial->szByte && !(serial->szByte & 1) && serial->pRawData >= sizeof(*serial)
         && !(serial->pRawData & 1)

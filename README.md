@@ -29,3 +29,9 @@ Select the build target with the 'build_target' meson option.
  * linux (x86_64 Linux PC)
  * win64 (x86_64 Windows PC)
  * nx (Switch via libnx)
+
+The desktop palette decoder also recognizes the exact `compNum10` metadata
+written by the public nitrogfx tool into the upper format halfword of Pokemon
+palettes (`0x000a0004`). It normalizes that reviewed encoding to GX format4;
+other unexpected format flags remain invalid. This keeps valid original sprite
+palettes compatible with strict bounds validation.
