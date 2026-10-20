@@ -14,6 +14,13 @@ BOOL NNS_G2dGetUnpackedPaletteData(void * pNclrFile, NNSG2dPaletteData ** ppPltD
 BOOL NNS_G2dGetUnpackedPaletteCompressInfo(void * pNclrFile, NNSG2dPaletteCompressInfo ** ppPltCmpInfo);
 
 #ifdef SDK_PORT
+/* Desktop descriptors borrow source bytes and remain valid until that source
+ * allocation is freed. Non-expheap owners must call the cleanup hook themselves.
+ * Legacy unsized entry points cannot verify the actual allocation extent. */
+BOOL NNS_G2dGetUnpackedPaletteDataSized(void * file, u32 available, NNSG2dPaletteData ** output);
+BOOL NNS_G2dGetUnpackedPaletteCompressInfoSized(void * file, u32 available, NNSG2dPaletteCompressInfo ** output);
+void WIN_CheckAndFreePaletteData(void * start, void * end);
+/* These record-only helpers also lack an allocation length. */
 void * NNS_G2dUnpackNCL (NNSG2dPaletteData* pPlttData);
 void * NNSi_G2dUnpackNCLCmpInfo(NNSG2dPaletteCompressInfo* pPlttCmpData);
 #else

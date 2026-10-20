@@ -19,14 +19,139 @@ static const char * StrNNSG2dPaletteFmt_ [] = {
 #endif
 
 #ifdef SDK_PORT
-#define NCL_PALETTE_DATA_OUT_MAX 64
-#define NCL_PALETTE_DATA_OUT_MAX_SIZE 1024
-#define NCL_CMP_DATA_OUT_MAX 64
-static u8 paletteDataOut[NCL_PALETTE_DATA_OUT_MAX][NCL_PALETTE_DATA_OUT_MAX_SIZE] = {0};
-static u8 curPaletteDataOut = 0;
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdatomic.h>
 
-static u8 cmpDataOut[NCL_PALETTE_DATA_OUT_MAX][sizeof(NNSG2dPaletteCompressInfo)] = {0};
-static u8 curCmpDataOut = 0;
+_Static_assert(sizeof(WIN_NNSG2dPaletteData) == 16, "NCLR serialized palette must remain 16 bytes");
+_Static_assert(sizeof(WIN_NNSG2dPaletteCompressInfo) == 8, "NCLR serialized compression record must remain 8 bytes");
+_Static_assert(sizeof(NNSG2dBinaryFileHeader) == 16 && sizeof(NNSG2dBinaryBlockHeader) == 8, "NCLR serialized headers changed");
+
+/* Serialized offsets remain 32-bit on desktop. Native descriptors are separate
+ * allocations; their raw data/index tables borrow the source file's lifetime.
+ * The game heap releases these views before recycling the source allocation. */
+typedef struct WIN_NCLView {
+    const void * source;
+    BOOL compressed;
+    NNSG2dPaletteData palette;
+    NNSG2dPaletteCompressInfo compression;
+    struct WIN_NCLView * next;
+} WIN_NCLView;
+static WIN_NCLView * s_paletteViews;
+static atomic_flag s_paletteViewLock = ATOMIC_FLAG_INIT;
+
+static void WIN_LockPaletteViews(void)
+{
+    while (atomic_flag_test_and_set_explicit(&s_paletteViewLock, memory_order_acquire)) {}
+}
+static void WIN_UnlockPaletteViews(void)
+{
+    atomic_flag_clear_explicit(&s_paletteViewLock, memory_order_release);
+}
+static WIN_NCLView * WIN_FindOrCreatePaletteView(const void * source, BOOL compressed)
+{
+    WIN_NCLView * view;
+    for (view = s_paletteViews; view; view = view->next) {
+        if (view->source == source && view->compressed == compressed) return view;
+    }
+    view = malloc(sizeof(*view));
+    if (!view) return NULL;
+    memset(view, 0, sizeof(*view));
+    view->source = source; view->compressed = compressed;
+    view->next = s_paletteViews; s_paletteViews = view;
+    return view;
+}
+void WIN_CheckAndFreePaletteData(void * start, void * end)
+{
+    WIN_NCLView ** link;
+    uintptr_t first = (uintptr_t)start, last = (uintptr_t)end;
+    if (last <= first) return;
+    WIN_LockPaletteViews();
+    link = &s_paletteViews;
+    while (*link) {
+        WIN_NCLView * view = *link;
+        uintptr_t source = (uintptr_t)view->source;
+        if (source >= first && source < last) { *link = view->next; free(view); }
+        else link = &view->next;
+    }
+    WIN_UnlockPaletteViews();
+}
+
+static const u8 * WIN_FindPaletteBlock(const void * file, u32 available, u32 kind, u32 * dataSize)
+{
+    NNSG2dBinaryFileHeader header;
+    const u8 * found = NULL;
+    u32 cursor, i;
+    if (!file || available < sizeof(header)) return NULL;
+    memcpy(&header, file, sizeof(header));
+    if ((header.signature != NNS_G2D_BINFILE_SIG_PALETTEDATA && header.signature != NNS_G2D_BINFILE_SIG_PALETTEDATA_OLD)
+        || header.byteOrder != NNS_G2D_LITTLEENDIAN_BITMARK || header.version < BIN_FILE_VERSION(NCLR)
+        || header.headerSize < sizeof(header) || header.fileSize > available || header.headerSize > header.fileSize
+        || header.dataBlocks > (header.fileSize - header.headerSize) / sizeof(NNSG2dBinaryBlockHeader)) return NULL;
+    cursor = header.headerSize;
+    for (i = 0; i < header.dataBlocks; ++i) {
+        NNSG2dBinaryBlockHeader block;
+        if (sizeof(block) > header.fileSize - cursor) return NULL;
+        memcpy(&block, (const u8 *)file + cursor, sizeof(block));
+        if (block.size < sizeof(block) || block.size > header.fileSize - cursor) return NULL;
+        if (!found && block.kind == kind) {
+            found = (const u8 *)file + cursor + sizeof(block);
+            *dataSize = block.size - sizeof(block);
+        }
+        cursor += block.size;
+    }
+    return found;
+}
+
+static BOOL WIN_ReadPalette(const void * source, WIN_NNSG2dPaletteData * serial)
+{
+    if (!source) return FALSE;
+    memcpy(serial, source, sizeof(*serial));
+    return serial->fmt >= GX_TEXFMT_PLTT16 && serial->fmt <= GX_TEXFMT_PLTT256
+        && serial->szByte && !(serial->szByte & 1) && serial->pRawData >= sizeof(*serial)
+        && !(serial->pRawData & 1)
+        && serial->pRawData <= UINTPTR_MAX - (uintptr_t)source
+        && serial->szByte <= UINTPTR_MAX - ((uintptr_t)source + serial->pRawData);
+}
+
+BOOL NNS_G2dGetUnpackedPaletteDataSized(void * file, u32 available, NNSG2dPaletteData ** output)
+{
+    u32 size = 0;
+    const u8 * source;
+    WIN_NNSG2dPaletteData serial;
+    WIN_NCLView * view;
+    if (!output) return FALSE;
+    *output = NULL;
+    source = WIN_FindPaletteBlock(file, available, NNS_G2D_BINBLK_SIG_PALETTEDATA, &size);
+    if (!source || size < sizeof(serial) || !WIN_ReadPalette(source, &serial)
+        || serial.pRawData > size || serial.szByte > size - serial.pRawData) return FALSE;
+    WIN_LockPaletteViews();
+    view = WIN_FindOrCreatePaletteView(source, FALSE);
+    if (view) {
+        view->palette.fmt = serial.fmt; view->palette.bExtendedPlt = serial.bExtendedPlt;
+        view->palette.szByte = serial.szByte; view->palette.pRawData = (void *)(source + serial.pRawData);
+        *output = &view->palette;
+    }
+    WIN_UnlockPaletteViews();
+    return view != NULL;
+}
+
+BOOL NNS_G2dGetUnpackedPaletteCompressInfoSized(void * file, u32 available, NNSG2dPaletteCompressInfo ** output)
+{
+    u32 size = 0;
+    const u8 * source;
+    WIN_NNSG2dPaletteCompressInfo serial;
+    if (!output) return FALSE;
+    *output = NULL;
+    source = WIN_FindPaletteBlock(file, available, NNS_G2D_BINBLK_SIG_PALETTECOMPINFO, &size);
+    if (!source || size < sizeof(serial)) return FALSE;
+    memcpy(&serial, source, sizeof(serial));
+    if (serial.pPlttIdxTbl < sizeof(serial) || (serial.pPlttIdxTbl & 1)
+        || serial.pPlttIdxTbl > size || (u32)serial.numPalette * sizeof(u16) > size - serial.pPlttIdxTbl) return FALSE;
+    *output = NNSi_G2dUnpackNCLCmpInfo((NNSG2dPaletteCompressInfo *)(void *)source);
+    return *output != NULL;
+}
 #endif
 
 static void DumpPalette_ (const NNSG2dPaletteData * pPlttData)
@@ -34,10 +159,20 @@ static void DumpPalette_ (const NNSG2dPaletteData * pPlttData)
     NNS_G2D_NULL_ASSERT(pPlttData);
     NNS_G2D_NULL_ASSERT(pPlttData->pRawData);
     {
+#ifdef SDK_PORT
+        u32 i;
+#else
         u16 i;
+#endif
         const u16 * pColor = (const u16 *)pPlttData->pRawData;
         OS_Printf("\n ---------------- palette ---------------- \n");
-        for (i = 0; i < 16 * 16; i++) {
+        for (i = 0; i <
+#ifdef SDK_PORT
+             pPlttData->szByte / sizeof(u16)
+#else
+             16 * 16
+#endif
+             ; i++) {
             if ((i & 0xF) == 0) {
                 OS_Printf("\n");
             }
@@ -50,6 +185,16 @@ static void DumpPalette_ (const NNSG2dPaletteData * pPlttData)
 
 BOOL NNS_G2dGetUnpackedPaletteData (void * pNclrFile, NNSG2dPaletteData ** ppPltData)
 {
+#ifdef SDK_PORT
+    NNSG2dBinaryFileHeader header;
+    if (!ppPltData) return FALSE;
+    *ppPltData = NULL;
+    if (!pNclrFile) return FALSE;
+    /* Legacy API has no allocation length. It requires a readable header and
+     * the complete declared fileSize; use the Sized API for bounded input. */
+    memcpy(&header, pNclrFile, sizeof(header));
+    return NNS_G2dGetUnpackedPaletteDataSized(pNclrFile, header.fileSize, ppPltData);
+#else
     NNS_G2D_NULL_ASSERT(pNclrFile);
     NNS_G2D_NULL_ASSERT(ppPltData);
 
@@ -72,25 +217,8 @@ BOOL NNS_G2dGetUnpackedPaletteData (void * pNclrFile, NNSG2dPaletteData ** ppPlt
                 (NNSG2dPaletteDataBlock *)NNS_G2dFindBinaryBlock(pBinFile,
                                                                  NNS_G2D_BINBLK_SIG_PALETTEDATA);
             if (pBinBlk) {
-                #ifdef SDK_PORT
-                void * rawDataPtr;
-                rawDataPtr = NNS_G2dUnpackNCL((void*)&pBinBlk->paletteData);
-                *ppPltData = &pBinBlk->paletteData;
-                u8 * tempBuf;
-                tempBuf = (u8*)(paletteDataOut[curPaletteDataOut]);
-                curPaletteDataOut++;
-                if( curPaletteDataOut >= NCL_PALETTE_DATA_OUT_MAX )
-                {
-                    curPaletteDataOut = 0;
-                }
-                //tempBuf = malloc( pBinBlk->paletteData.szByte );
-                memcpy( tempBuf, rawDataPtr, pBinBlk->blockHeader.size );
-                pBinBlk->paletteData.pRawData = tempBuf;
-                //PCPORT_TODO: Memory Leaks!
-                #else
                 NNS_G2dUnpackNCL((void *)&pBinBlk->paletteData);
                 *ppPltData = &pBinBlk->paletteData;
-                #endif
                 return TRUE;
             } else {
                 *ppPltData = NULL;
@@ -99,10 +227,19 @@ BOOL NNS_G2dGetUnpackedPaletteData (void * pNclrFile, NNSG2dPaletteData ** ppPlt
             }
         }
     }
+#endif
 }
 
 BOOL NNS_G2dGetUnpackedPaletteCompressInfo (void * pNclrFile, NNSG2dPaletteCompressInfo ** ppPltCmpInfo)
 {
+#ifdef SDK_PORT
+    NNSG2dBinaryFileHeader header;
+    if (!ppPltCmpInfo) return FALSE;
+    *ppPltCmpInfo = NULL;
+    if (!pNclrFile) return FALSE;
+    memcpy(&header, pNclrFile, sizeof(header));
+    return NNS_G2dGetUnpackedPaletteCompressInfoSized(pNclrFile, header.fileSize, ppPltCmpInfo);
+#else
     NNS_G2D_NULL_ASSERT(pNclrFile);
     NNS_G2D_NULL_ASSERT(ppPltCmpInfo);
 
@@ -125,12 +262,8 @@ BOOL NNS_G2dGetUnpackedPaletteCompressInfo (void * pNclrFile, NNSG2dPaletteCompr
                 (NNSG2dPaletteCompressDataBlock *)NNS_G2dFindBinaryBlock(pBinFile,
                                                                          NNS_G2D_BINBLK_SIG_PALETTECOMPINFO);
             if (pBinBlk) {
-                #ifdef SDK_PORT
-                *ppPltCmpInfo = NNSi_G2dUnpackNCLCmpInfo((void*)&pBinBlk->plttCmpInfo);
-                #else
                 NNSi_G2dUnpackNCLCmpInfo((void *)&pBinBlk->plttCmpInfo);
                 *ppPltCmpInfo = &pBinBlk->plttCmpInfo;
-                #endif
                 return TRUE;
             } else {
                 *ppPltCmpInfo = NULL;
@@ -138,6 +271,7 @@ BOOL NNS_G2dGetUnpackedPaletteCompressInfo (void * pNclrFile, NNSG2dPaletteCompr
             }
         }
     }
+#endif
 }
 
 #ifdef SDK_PORT
@@ -149,20 +283,23 @@ void NNSi_G2dUnpackNCLCmpInfo (NNSG2dPaletteCompressInfo * pPlttCmpInfo)
     NNS_G2D_NULL_ASSERT(pPlttCmpInfo);
 
 #ifdef SDK_PORT
-    void * pPlttCmpInfoTmp = (void*)pPlttCmpInfo;
-    u32 pPlttIdxTblOffset = *(u32*)(pPlttCmpInfoTmp+4);
-    void * pPlttIdxTbl = (void*)((u64)pPlttCmpInfoTmp + (u64)pPlttIdxTblOffset);
-
-    NNSG2dPaletteCompressInfo * pPlttCmpInfoOut = (NNSG2dPaletteCompressInfo*)cmpDataOut[curCmpDataOut];
-    pPlttCmpInfoOut->numPalette = pPlttCmpInfo->numPalette;
-    pPlttCmpInfoOut->pad16 = pPlttCmpInfo->pad16;
-    pPlttCmpInfoOut->pPlttIdxTbl = pPlttIdxTbl;
-    NNSI_G2D_DEBUGMSG0("Unpacking NCLR(Compressed) file is successful.\n" );
-    curCmpDataOut ++;
-    if(curCmpDataOut >= NCL_CMP_DATA_OUT_MAX){
-        curCmpDataOut = 0;
+    WIN_NNSG2dPaletteCompressInfo serial;
+    WIN_NCLView * view;
+    void * result = NULL;
+    if (!pPlttCmpInfo) return NULL;
+    memcpy(&serial, pPlttCmpInfo, sizeof(serial));
+    if (serial.pPlttIdxTbl < sizeof(serial) || (serial.pPlttIdxTbl & 1)
+        || serial.pPlttIdxTbl > UINTPTR_MAX - (uintptr_t)pPlttCmpInfo
+        || (u32)serial.numPalette * sizeof(u16) > UINTPTR_MAX - ((uintptr_t)pPlttCmpInfo + serial.pPlttIdxTbl)) return NULL;
+    WIN_LockPaletteViews();
+    view = WIN_FindOrCreatePaletteView(pPlttCmpInfo, TRUE);
+    if (view) {
+        view->compression.numPalette = serial.numPalette; view->compression.pad16 = serial.pad16;
+        view->compression.pPlttIdxTbl = (u8 *)pPlttCmpInfo + serial.pPlttIdxTbl;
+        result = &view->compression;
     }
-    return pPlttCmpInfoOut;
+    WIN_UnlockPaletteViews();
+    return result;
 #else
     pPlttCmpInfo->pPlttIdxTbl = NNS_G2D_UNPACK_OFFSET_PTR(pPlttCmpInfo->pPlttIdxTbl, pPlttCmpInfo);
     NNSI_G2D_DEBUGMSG0("Unpacking NCLR(Compressed) file is successful.\n");
@@ -178,11 +315,9 @@ void NNS_G2dUnpackNCL (NNSG2dPaletteData * pPlttData)
     NNS_G2D_NULL_ASSERT(pPlttData);
 
     #ifdef SDK_PORT
-    WIN_NNSG2dPaletteData * pPlttDataWin;
-    pPlttDataWin = (WIN_NNSG2dPaletteData *)pPlttData;
-    u64 rawDataOffset = pPlttDataWin->pRawData;
-    void * rawDataPtr =  (void *)( (u8*)pPlttData + rawDataOffset );
-    return rawDataPtr;
+    WIN_NNSG2dPaletteData serial;
+    if (!WIN_ReadPalette(pPlttData, &serial)) return NULL;
+    return (u8 *)pPlttData + serial.pRawData;
     #else
     pPlttData->pRawData = NNS_G2D_UNPACK_OFFSET_PTR(pPlttData->pRawData, pPlttData);
     #endif

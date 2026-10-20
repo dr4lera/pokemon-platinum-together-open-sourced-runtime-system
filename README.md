@@ -1,4 +1,24 @@
 # libntrsystem
+
+This separately maintained community-runtime fork starts at
+cybervisi0n/libntrsystem `cd778c9d5e45869f8ecb8245b316ac20ea576958`.
+It supports the user's source gameplay client; existing upstream provenance and
+notices are retained. New changes were developed with OpenAI Codex assistance
+and are not submitted upstream.
+
+The desktop NCLR loader now interprets serialized 32-bit fields separately from
+native pointers, borrows the exact validated palette payload and owns stable
+typed descriptors until their source heap allocation is released. It no longer
+copies beyond a short palette or writes native pointers into its file bytes.
+Explicit sized entry points validate actual supplied extents; the inherited
+unsized API still requires a complete buffer matching its declared file size.
+The ARM decoding branch is preserved.
+
+The gameplay client's `tests/run_community_palette.py` compiles this actual loader
+and actual SDK structures against synthetic, guard-page-protected resources.
+Those checks establish decoder and descriptor-lifetime behavior, not full game
+or graphics parity. No game assets, saves or private references are included.
+
 Drop-in replacement for NitroSystem that targets Nintendo DS, PC, and other platforms.
 
 libntrsystem makes it easier to port Nintendo DS games to PC and other platforms by handling the logic for common libraries used by nearly all Nintendo DS games.

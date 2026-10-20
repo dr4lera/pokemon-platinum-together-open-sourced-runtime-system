@@ -12,6 +12,7 @@
 #include <nnsys/g2d/load/g2d_NAN_load.h>
 #include <nnsys/g2d/load/g2d_NCE_load.h>
 #include <nnsys/g2d/load/g2d_NCG_load.h>
+#include <nnsys/g2d/load/g2d_NCL_load.h>
 #endif
 
 #define MBLOCK_FREE_SIGNATURE   ('FR')
@@ -632,6 +633,12 @@ NNSFndHeapHandle NNS_FndCreateExpHeapEx (void * startAddress, u32 size, u16 optF
 void NNS_FndDestroyExpHeap (NNSFndHeapHandle heap)
 {
     NNS_ASSERT(IsValidExpHeapHandle(heap));
+#ifdef SDK_PORT
+    {
+        NNSiFndHeapHead * head = heap;
+        WIN_CheckAndFreePaletteData(head->heapStart, head->heapEnd);
+    }
+#endif
     NNSi_FndFinalizeHeap(heap);
 }
 
@@ -749,6 +756,7 @@ void NNS_FndFreeToExpHeap (NNSFndHeapHandle heap, void * memBlock)
         WIN_CheckAndFreeAnimBank(region.start, region.end);
         WIN_CheckAndFreeCellBank(region.start, region.end);
         WIN_CheckAndFreeCharData(region.start, region.end);
+        WIN_CheckAndFreePaletteData(region.start, region.end);
         #endif
         (void)RemoveMBlock(&pExpHeapHd->mbUsedList, pMBHead);
         (void)RecycleRegion(pExpHeapHd, &region);

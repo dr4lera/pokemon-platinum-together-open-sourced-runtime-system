@@ -3,3 +3,4 @@ subprojects/.wraplock
 subprojects/NitroSDK/
 .fontconfig_cache/
 subprojects/libntr/
+.meson-subproject-wrap-hash.txt
